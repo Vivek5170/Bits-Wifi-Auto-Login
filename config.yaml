@@ -1,0 +1,17 @@
+# BITS Wi-Fi auto-login — all knobs live here. Times in seconds, quota in MB.
+# Lines starting with # are comments. Keep it flat: one `key: value` per line.
+
+credentials_file: credentials.txt
+
+heartbeat_interval: 10      # sec per main-loop beat; scheduler for everything
+usage_check_heartbeats: 15  # check active quota every N beats (15x10s = 150s)
+
+ping_timeout: 4
+login_timeout: 10
+portal_host: 172.16.0.30
+
+switch_start_mb: 9500      # USED crosses this -> sweep + switch accounts
+reset_time: "00:00"        # 24h HH:MM — daily quota reset; sweeps restart from #1 after this
+random_seed: 1234          # null -> seed from current time (--seed N overrides)
+
+failed_file: failed.txt    # wrong passwords remembered here (skipped while unchanged)
