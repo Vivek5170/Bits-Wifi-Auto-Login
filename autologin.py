@@ -351,11 +351,14 @@ def retry_transient(user, fetch):
     return False, None
 
 
-def sweep(order, start, bad, exclude=None):
+def sweep(order, start, bad, refreshed, active_idx, exclude=None):
     """The ONLY account-selection mechanism. One forward pass from `start`,
     wrapping once; each account is inspected at most once per sweep.
 
     Uses a LOCAL cursor: persistent `curr` is never touched here.
+    `refreshed` holds indices probed since the last reset; a fresh account
+    gets one captive probe to trigger the backend quota refresh, then an
+    immediate restore to `active_idx` so the sweep looks side-effect-free.
     Returns (index, quota, "candidate"), (None, None, RESTART), or
     (None, None, EXHAUSTED).
     """
@@ -369,21 +372,67 @@ def sweep(order, start, bad, exclude=None):
         if (user, pwd) in bad:
             log.warning(" Skipping %s — wrong password.", user)
             continue
-        ok, q = retry_transient(user, lambda: check_quota(user, pwd))
+        probed_ok = False
+        if i not in refreshed:
+            # First sighting since reset: quota API may be stale (false
+            # exhausted), so captive-login once to trigger the real reset.
+            def attempt_probe(u=user, p=pwd):
+                res = try_login(u, p)
+                return None if res == "portal_down" else res
+
+            ok, res = retry_transient(user, attempt_probe)
+            if not ok:
+                return None, None, RESTART
+            if res == "failed":
+                log.warning(" Skipping %s — wrong password.", user)
+                mark_bad((user, pwd), bad)
+                refreshed.add(i)
+                continue
+            if res == "exceeded":
+                # Probe rejected: genuinely exhausted even after trigger.
+                log.warning(" Skipping %s — quota exhausted.", user)
+                refreshed.add(i)
+                continue
+            # res == "ok": refresh triggered for this account.
+            refreshed.add(i)
+            probed_ok = True
+            log.info(" Refreshed %s — restoring session.", user)
+            if active_idx is not None and active_idx != i:
+                au, ap = order[active_idx]
+
+                def attempt_restore(au=au, ap=ap):
+                    r2 = try_login(au, ap)
+                    return None if r2 == "portal_down" else r2
+
+                ok2, r2 = retry_transient(au, attempt_restore)
+                if not ok2:
+                    return None, None, RESTART
+                if r2 != "ok":
+                    # Current session is dead (why we're sweeping) — can't
+                    # restore, let the caller re-establish from scratch.
+                    log.warning(" Restore to %s failed (%s) — restarting.",
+                                au, r2)
+                    return None, None, RESTART
+        ok, q = retry_transient(user, lambda u=user, p=pwd: check_quota(u, p))
         if not ok:
             return None, None, RESTART
         if q.get("badpass"):
             log.warning(" Skipping %s — wrong password.", user)
             mark_bad((user, pwd), bad)
             continue
-        if q["used"] >= SWITCH_START_MB:
+        if q["used"] >= SWITCH_START_MB and not probed_ok:
             log.warning(" Skipping %s — quota exhausted.", user)
             continue
+        if q["used"] >= SWITCH_START_MB and probed_ok:
+            # Captive just accepted us but the meter still reads high:
+            # trust the captive (ground truth for internet), not the meter.
+            log.warning(" %s meter stale (%.0fMB) but login works — taking it.",
+                         user, q["used"])
         return i, q, "candidate"
     return None, None, EXHAUSTED
 
 
-def try_establish(order, start, bad):
+def try_establish(order, start, bad, refreshed, active_idx):
     """One establishment round from `start`: sweep, then captive-login the candidate
     with the SAME retry mechanism. A classified captive failure continues
     from the NEXT account (failed pairs persist as bad, exceeded ones are
@@ -394,7 +443,7 @@ def try_establish(order, start, bad):
     exclude = set()
     s = start
     while True:
-        idx, q, outcome = sweep(order, s, bad, exclude)
+        idx, q, outcome = sweep(order, s, bad, refreshed, active_idx, exclude)
         if outcome == RESTART:
             return (RESTART,)
         if outcome == EXHAUSTED:
@@ -456,6 +505,8 @@ def run(order):
                  len(bad), FAILED_FILE)
     curr = 0             # active account; also the next sweep's start
     active = None        # no account established yet (see startup rule below)
+    refreshed = set()    # indices captive-probed since last reset (false-exhaust fix)
+    today = datetime.now().date()
     usage_heartbeat_counter = 0
     was_on_campus = None  # log campus transitions only, not every heartbeat
     log.info(" Order: %s", ", ".join(u for u, _ in order))
@@ -465,6 +516,12 @@ def run(order):
              SWITCH_START_MB, RESET_TIME)
 
     while True:  # the ONE main event loop
+        if datetime.now().date() != today:
+            # Crossed calendar day (covers reset_time): stale refresh flags
+            # would falsely skip probing, so drop them.
+            today = datetime.now().date()
+            refreshed.clear()
+            log.info(" New day — cleared refresh flags.")
         on_campus = is_on_campus()
         if not on_campus:
             if was_on_campus is not False:
@@ -486,13 +543,15 @@ def run(order):
         if not up or active is None:
             if not up:
                 log.info(" Internet down — finding usable account.")
-            outcome = try_establish(order, curr, bad)
+            outcome = try_establish(order, curr, bad, refreshed, active)
             if outcome[0] == RESTART:
                 time.sleep(HEARTBEAT_INTERVAL)
                 continue
             if outcome[0] == EXHAUSTED:
                 wait_for_reset()   # quotas refill only at reset
                 curr, active, usage_heartbeat_counter = 0, None, 0
+                refreshed.clear()
+                today = datetime.now().date()
                 continue
             _, idx, q = outcome
             curr = idx
@@ -520,12 +579,14 @@ def run(order):
             elif q["used"] >= SWITCH_START_MB:
                 log.warning(" %s reached %.0fMB — sweeping for a new account.",
                             user, q["used"])
-                outcome = try_establish(order, curr, bad)
+                outcome = try_establish(order, curr, bad, refreshed, active)
                 if outcome[0] == RESTART:
                     continue
                 if outcome[0] == EXHAUSTED:
                     wait_for_reset()
                     curr, active, usage_heartbeat_counter = 0, None, 0
+                    refreshed.clear()
+                    today = datetime.now().date()
                     continue
                 _, idx, nq = outcome
                 curr = idx
